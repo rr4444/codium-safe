@@ -1,0 +1,681 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# codium-safe: Streamlined Hardened Launcher for Antigravity & Pi Agents
+# ==============================================================================
+set -euo pipefail
+
+# ==============================================================================
+# CONFIGURABLE DEFAULTS (Overridable via CLI Flags or Environment Variables)
+# ==============================================================================
+# Default SSH key filenames in ~/.ssh/ to arm in ssh-agent (space-separated)
+SSH_KEY_NAMES=(id_ed25519 id_rsa id_ecdsa)
+
+# Antigravity (AGY) Engine Controls
+AGY_ENABLE_TERMINAL_SANDBOX="${AGY_ENABLE_TERMINAL_SANDBOX:-true}"
+AGY_TOOL_PERMISSION="${AGY_TOOL_PERMISSION:-proceed-in-sandbox}"
+AGY_NON_WORKSPACE_ACCESS="${AGY_NON_WORKSPACE_ACCESS:-ask}"
+AGY_DEFAULT_COMMAND_DENYLIST=("git push*" "rm -rf /*" "dd *" "shutdown *" "reboot *" "mkfs*")
+
+# Container & Kubernetes Controls (Opt-in)
+ENABLE_K8S="${ENABLE_K8S:-false}"
+REFRESH_K8S=false
+ENABLE_DOCKER_SOCKET="${ENABLE_DOCKER_SOCKET:-false}"
+ENABLE_PODMAN_SOCKET="${ENABLE_PODMAN_SOCKET:-false}"
+FORCE_YES=false
+GLOBAL_AI_SECRETS="${GLOBAL_AI_SECRETS:-$HOME/.config/ai-agents.env}"
+
+# ANSI Colors (Bash ANSI-C Quoting for Terminal Formatting)
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
+
+info()  { echo -e "${BLUE}[codium-safe]${NC} $*"; }
+ok()    { echo -e "${GREEN}[codium-safe:ok]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[codium-safe:warn]${NC} $*"; }
+fail()  { echo -e "${RED}[codium-safe:error]${NC} $*" >&2; exit 1; }
+
+# ==============================================================================
+# CLI HELP MENU
+# ==============================================================================
+show_help() {
+  cat << EOF
+${BOLD}codium-safe${NC} - Streamlined Hardened VSCodium Launcher
+
+${BOLD}USAGE:${NC}
+  codium-safe [OPTIONS] [WORKSPACE_DIR...]
+
+${BOLD}ARGUMENTS:${NC}
+  WORKSPACE_DIR...        One or more project directories to mount and open.
+                          - In terminal: run 'codium-safe .' for current directory.
+                          - From GUI menu: prompts via native KDE/GNOME folder dialog.
+
+${BOLD}OPTIONS:${NC}
+  -e, --env KEY=VAL       Inject environment variable and auto-persist to .envrc
+  --env-file=PATH         Load environment variables from file into session memory
+  --key=NAME              SSH key file in ~/.ssh/ to arm (can specify multiple times)
+  --k8s                   Initialize isolated dev-<project> Kubernetes namespace & .kubeconfig
+  --k8s-refresh           Force re-generation of project .kubeconfig token from cluster
+  --docker                Enable Docker socket passthrough (/var/run/docker.sock)
+  --podman                Enable Rootless Podman socket passthrough
+  --allow-push            Temporarily allow 'git push*' in Antigravity command denylist
+  --install-desktop       Install or update desktop application menu launcher (.desktop)
+  --install-system-deps   Add VSCodium repository and install all required APT packages
+  -y, --yes               Assume yes for prompts during dependency installation
+  -h, --help              Show this help message and exit
+
+${BOLD}EXAMPLES:${NC}
+  codium-safe --install-system-deps                      # Standalone setup of all packages
+  codium-safe .                                          # Open current directory
+  codium-safe ~/code/my-project                          # Open specific project
+  codium-safe ~/code/frontend ~/code/backend             # Open multi-root workspace
+  codium-safe -e ANSIBLE_FORKS=20 ~/code/my-project      # Inject envvar with auto-direnv
+  codium-safe --docker ~/code/my-project                 # Enable Docker container builds
+  codium-safe --k8s ~/code/my-project                    # Isolated namespace & kubeconfig
+  codium-safe --key=id_github --key=id_gitea             # Arm multiple SSH keys
+EOF
+  exit 0
+}
+
+# ==============================================================================
+# STRICT ZERO-ARGUMENT TERMINAL HELP CHECK
+# ==============================================================================
+if [ $# -eq 0 ] && [ -t 0 ]; then
+  show_help
+fi
+
+# ==============================================================================
+# CLI FLAGS PARSING
+# ==============================================================================
+TARGET_WORKSPACES=()
+CLI_AGY_DENYLIST=("${AGY_DEFAULT_COMMAND_DENYLIST[@]}")
+CLI_CUSTOM_KEYS=()
+SESSION_CUSTOM_ENVS=()
+SESSION_ENV_FILES=()
+RUN_INSTALL_DEPS=false
+JUST_INSTALL_DESKTOP=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --key=*)
+      CLI_CUSTOM_KEYS+=("${1#*=}")
+      shift
+      ;;
+    -e|--env)
+      SESSION_CUSTOM_ENVS+=("$2")
+      shift 2
+      ;;
+    --env=*)
+      SESSION_CUSTOM_ENVS+=("${1#*=}")
+      shift
+      ;;
+    --env-file=*)
+      SESSION_ENV_FILES+=("${1#*=}")
+      shift
+      ;;
+    --docker)
+      ENABLE_DOCKER_SOCKET="true"
+      shift
+      ;;
+    --podman)
+      ENABLE_PODMAN_SOCKET="true"
+      shift
+      ;;
+    --k8s)
+      ENABLE_K8S="true"
+      shift
+      ;;
+    --k8s-refresh)
+      ENABLE_K8S="true"
+      REFRESH_K8S=true
+      shift
+      ;;
+    --allow-push)
+      TEMP_LIST=()
+      for item in "${CLI_AGY_DENYLIST[@]}"; do
+        [[ "$item" != "git push*" ]] && TEMP_LIST+=("$item")
+      done
+      CLI_AGY_DENYLIST=("${TEMP_LIST[@]}")
+      warn "Unattended 'git push*' has been ALLOWED for Antigravity in this session."
+      shift
+      ;;
+    --install-desktop)
+      JUST_INSTALL_DESKTOP=true
+      shift
+      ;;
+    --install-system-deps)
+      RUN_INSTALL_DEPS=true
+      shift
+      ;;
+    -y|--yes)
+      FORCE_YES=true
+      shift
+      ;;
+    -h|--help)
+      show_help
+      ;;
+    -*)
+      fail "Unknown option: $1 (Run --help for usage)"
+      ;;
+    *)
+      TARGET_WORKSPACES+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ ${#CLI_CUSTOM_KEYS[@]} -gt 0 ]; then
+  SSH_KEY_NAMES=("${CLI_CUSTOM_KEYS[@]}")
+else
+  # Auto-discover existing private keys in ~/.ssh/ (so desktop launcher needs zero flags)
+  DISCOVERED_KEYS=()
+  for k in "$HOME/.ssh"/id_*; do
+    if [ -f "$k" ] && [[ "$k" != *.pub ]] && [[ "$k" != *.old ]] && [[ "$k" != *.pem ]]; then
+      DISCOVERED_KEYS+=("$(basename "$k")")
+    fi
+  done
+  if [ ${#DISCOVERED_KEYS[@]} -gt 0 ]; then
+    SSH_KEY_NAMES=("${DISCOVERED_KEYS[@]}")
+  fi
+fi
+
+# ==============================================================================
+# 1. STANDALONE SYSTEM DEPENDENCY INSTALLER & APPARMOR PROVISIONER
+# ==============================================================================
+install_system_dependencies() {
+  info "Running standalone dependency analysis..."
+
+  DETECTED_OTHER_PACKAGES=()
+  if command -v flatpak >/dev/null 2>&1 && flatpak list --app 2>/dev/null | grep -q "com.vscodium.codium"; then
+    DETECTED_OTHER_PACKAGES+=("Flatpak (com.vscodium.codium)")
+  fi
+  if command -v snap >/dev/null 2>&1 && snap list 2>/dev/null | grep -q "^codium "; then
+    DETECTED_OTHER_PACKAGES+=("Snap (codium)")
+  fi
+
+  echo
+  echo -e "${YELLOW}${BOLD}=== SYSTEM DEPENDENCY INSTALLATION NOTICE ===${NC}"
+  echo -e "This script will install the required native system packages via APT:"
+  echo -e "  - ${BOLD}bubblewrap${NC}  (Kernel namespace unprivileged isolation sandbox)"
+  echo -e "  - ${BOLD}direnv${NC}      (Project-level environment variable loader)"
+  echo -e "  - ${BOLD}ksshaskpass${NC} (Native KDE Plasma graphical SSH key confirmation prompt)"
+  echo -e "  - ${BOLD}codium${NC}      (Native VSCodium .deb IDE binary)"
+  echo
+  echo -e "To install native VSCodium, the official repository will be configured:"
+  echo -e "  - GPG Key:  ${BLUE}https://gitlab.com/paulcarroty/vscodium-deb-rpm-repo/raw/master/pub.gpg${NC}"
+  echo -e "  - APT Repo: ${BLUE}https://download.vscodium.com/debs vscodium main${NC}"
+  echo -e "  - Keyring:  /usr/share/keyrings/vscodium-archive-keyring.gpg"
+  echo -e "  - Source:   /etc/apt/sources.list.d/vscodium.list"
+  
+  if [ ${#DETECTED_OTHER_PACKAGES[@]} -gt 0 ]; then
+    echo
+    echo -e "${YELLOW}${BOLD}NOTICE: Existing VSCodium package(s) detected:${NC}"
+    for pkg in "${DETECTED_OTHER_PACKAGES[@]}"; do
+      echo -e "  - $pkg"
+    done
+    echo -e "The native .deb will be installed alongside it so Bubblewrap process sandboxing works cleanly."
+    echo -e "Your extensions and settings in ~/.config/VSCodium and ~/.vscode-oss will be automatically used."
+  fi
+  echo
+
+  if [ "$FORCE_YES" != "true" ]; then
+    read -r -p "Proceed with repository setup and installation? [y/N] " response
+    case "$response" in
+      [yY][eE][sS]|[yY])
+        ;;
+      *)
+        info "Installation cancelled by user."
+        exit 0
+        ;;
+    esac
+  fi
+
+  info "Fetching official VSCodium GPG key..."
+  wget -qO - https://gitlab.com/paulcarroty/vscodium-deb-rpm-repo/raw/master/pub.gpg | gpg --dearmor | sudo dd of=/usr/share/keyrings/vscodium-archive-keyring.gpg 2>/dev/null
+  
+  info "Adding VSCodium repository to /etc/apt/sources.list.d/vscodium.list..."
+  echo 'deb [ signed-by=/usr/share/keyrings/vscodium-archive-keyring.gpg ] https://download.vscodium.com/debs vscodium main' | sudo tee /etc/apt/sources.list.d/vscodium.list >/dev/null
+
+  info "Updating APT package lists..."
+  sudo apt update
+  
+  info "Installing packages: bubblewrap codium direnv ksshaskpass..."
+  sudo apt install -y bubblewrap codium direnv ksshaskpass
+
+  # Ubuntu 24.04 AppArmor User Namespace Resolution
+  if [ -d /etc/apparmor.d ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+    info "Configuring AppArmor profile for Bubblewrap on Ubuntu 24.04..."
+    sudo tee /etc/apparmor.d/bwrap >/dev/null << 'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}
+EOF
+    sudo apparmor_parser -r /etc/apparmor.d/bwrap 2>/dev/null || sudo systemctl restart apparmor 2>/dev/null || true
+    ok "AppArmor user namespace profile applied for /usr/bin/bwrap."
+  fi
+
+  ok "All system dependencies installed and verified successfully."
+  ok "You can now run: codium-safe [path-to-project]"
+  exit 0
+}
+
+if [ "$RUN_INSTALL_DEPS" = "true" ]; then
+  install_system_dependencies
+fi
+
+# ==============================================================================
+# 2. DESKTOP PARITY: DETECT GUI ENVIRONMENT & ASKPASS
+# ==============================================================================
+DETECTED_ASKPASS=""
+if command -v ksshaskpass >/dev/null 2>&1; then
+  DETECTED_ASKPASS="/usr/bin/ksshaskpass"
+elif command -v ssh-askpass-gnome >/dev/null 2>&1; then
+  DETECTED_ASKPASS="/usr/bin/ssh-askpass-gnome"
+elif command -v x11-ssh-askpass >/dev/null 2>&1; then
+  DETECTED_ASKPASS="/usr/lib/ssh/x11-ssh-askpass"
+fi
+
+# ==============================================================================
+# 3. SELF-INSTALLING DESKTOP ENTRY (.desktop)
+# ==============================================================================
+DESKTOP_ENTRY_DIR="$HOME/.local/share/applications"
+DESKTOP_ENTRY_FILE="$DESKTOP_ENTRY_DIR/codium-safe.desktop"
+
+install_desktop_entry() {
+  mkdir -p "$DESKTOP_ENTRY_DIR"
+  cat << EOF > "$DESKTOP_ENTRY_FILE"
+[Desktop Entry]
+Name=VSCodium (Sandboxed)
+GenericName=Hardened Cloud-Native Development Environment
+Comment=Launch VSCodium with Strict Antigravity & Pi Agent Whitelisting
+Exec=$HOME/.local/bin/codium-safe %F
+Icon=vscodium
+Terminal=false
+Type=Application
+StartupNotify=true
+Categories=Development;IDE;
+MimeType=inode/directory;
+EOF
+  chmod +x "$DESKTOP_ENTRY_FILE"
+  update-desktop-database "$DESKTOP_ENTRY_DIR" 2>/dev/null || true
+  ok "Installed desktop entry at $DESKTOP_ENTRY_FILE"
+}
+
+if [ ! -f "$DESKTOP_ENTRY_FILE" ] || [ "$JUST_INSTALL_DESKTOP" = "true" ]; then
+  install_desktop_entry
+  if [ "$JUST_INSTALL_DESKTOP" = "true" ]; then
+    exit 0
+  fi
+fi
+
+# ==============================================================================
+# 4. RESOLVE WORKSPACES (Single or Multiple Directories)
+# ==============================================================================
+RESOLVED_WORKSPACES=()
+
+if [ ${#TARGET_WORKSPACES[@]} -eq 0 ]; then
+  DEFAULT_PICK_ROOT="$HOME/Development"
+  [ ! -d "$DEFAULT_PICK_ROOT" ] && DEFAULT_PICK_ROOT="$HOME"
+  SELECTED_DIR=""
+  if command -v kdialog >/dev/null 2>&1; then
+    SELECTED_DIR="$(kdialog --getexistingdirectory "$DEFAULT_PICK_ROOT" --title "Select Project Workspace for VSCodium" 2>/dev/null || true)"
+  elif command -v zenity >/dev/null 2>&1; then
+    SELECTED_DIR="$(zenity --file-selection --directory --filename="$DEFAULT_PICK_ROOT/" --title="Select Project Workspace for VSCodium" 2>/dev/null || true)"
+  fi
+
+  if [ -n "$SELECTED_DIR" ]; then
+    RESOLVED_WORKSPACES+=("$(realpath "$SELECTED_DIR")")
+  else
+    RESOLVED_WORKSPACES+=("$(realpath "$DEFAULT_PICK_ROOT")")
+  fi
+else
+  for ws in "${TARGET_WORKSPACES[@]}"; do
+    RESOLVED_PATH="$(realpath "$ws" 2>/dev/null || echo "$PWD")"
+    mkdir -p "$RESOLVED_PATH"
+    RESOLVED_WORKSPACES+=("$RESOLVED_PATH")
+  done
+fi
+
+PRIMARY_WORKSPACE="${RESOLVED_WORKSPACES[0]}"
+ok "Primary workspace: $PRIMARY_WORKSPACE"
+
+# ==============================================================================
+# 5. PRE-FLIGHT DEPENDENCY & SANDBOX CHECKS
+# ==============================================================================
+MISSING_DEPS=()
+command -v bwrap >/dev/null 2>&1       || MISSING_DEPS+=("bubblewrap")
+command -v codium >/dev/null 2>&1      || MISSING_DEPS+=("codium")
+command -v direnv >/dev/null 2>&1      || MISSING_DEPS+=("direnv")
+
+if [ -z "$DETECTED_ASKPASS" ]; then
+  MISSING_DEPS+=("ksshaskpass")
+fi
+
+if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+  fail "Missing required system packages: ${MISSING_DEPS[*]}\nRun 'codium-safe --install-system-deps' to configure and install them."
+fi
+
+# Verify unprivileged user namespace capability
+if ! bwrap --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1; then
+  fail "Bubblewrap cannot create user namespaces (restricted by Ubuntu 24.04 AppArmor).\nRun 'codium-safe --install-system-deps' to configure the AppArmor profile."
+fi
+
+# ==============================================================================
+# 6. CACHE PROVISIONING & ANTIGRAVITY SECURITY LOCK
+# ==============================================================================
+CODIUM_CONFIG_DIR="$HOME/.config/VSCodium"
+CODIUM_EXT_DIR="$HOME/.vscode-oss"
+CODIUM_SHARED_DIR="$HOME/.vscode-oss-shared"
+GEMINI_CONFIG_DIR="$HOME/.gemini/antigravity-cli"
+
+PIP_CACHE_DIR="$HOME/.cache/pip"
+UV_CACHE_DIR="$HOME/.cache/uv"
+GO_PKG_DIR="$HOME/go/pkg"
+GO_CACHE_DIR="$HOME/.cache/go-build"
+TF_CACHE_DIR="$HOME/.cache/terraform/plugin-cache"
+HELM_CACHE_DIR="$HOME/.cache/helm"
+HELM_CONFIG_DIR="$HOME/.config/helm"
+K9S_CONFIG_DIR="$HOME/.config/k9s"
+ANSIBLE_DIR="$HOME/.ansible"
+ANSIBLE_LINT_CACHE="$HOME/.cache/ansible-lint"
+
+mkdir -p "$CODIUM_CONFIG_DIR" "$CODIUM_EXT_DIR" "$CODIUM_SHARED_DIR" "$GEMINI_CONFIG_DIR" \
+         "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$GO_PKG_DIR" "$GO_CACHE_DIR" \
+         "$TF_CACHE_DIR" "$HELM_CACHE_DIR" "$HELM_CONFIG_DIR" "$K9S_CONFIG_DIR" \
+         "$ANSIBLE_DIR/cp" "$ANSIBLE_LINT_CACHE"
+
+SETTINGS_FILE="$GEMINI_CONFIG_DIR/settings.json"
+python3 - << EOF
+import json, os
+path = os.path.expanduser("$SETTINGS_FILE")
+try:
+    with open(path, "r") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+
+data["enableTerminalSandbox"] = True if "$AGY_ENABLE_TERMINAL_SANDBOX".lower() == "true" else False
+data["toolPermission"] = "$AGY_TOOL_PERMISSION"
+data["nonWorkspaceFileAccess"] = "$AGY_NON_WORKSPACE_ACCESS"
+data["commandDenylist"] = $(python3 -c "import json, sys; print(json.dumps(sys.argv[1:]))" "${CLI_AGY_DENYLIST[@]}")
+
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+EOF
+ok "Antigravity settings.json verified and locked."
+
+# ==============================================================================
+# 7. ONE-STOP-SHOP ENVIRONMENT VARIABLES & AUTOMATED .envrc
+# ==============================================================================
+ENVRC_FILE="$PRIMARY_WORKSPACE/.envrc"
+if [ ! -f "$ENVRC_FILE" ]; then
+  info "Generating default .envrc..."
+  cat << 'EOF' > "$ENVRC_FILE"
+# Auto-generated by codium-safe
+layout python python3
+[ -f .kubeconfig ] && export KUBECONFIG="$PWD/.kubeconfig"
+export TF_PLUGIN_CACHE_DIR="$HOME/.cache/terraform/plugin-cache"
+export ANSIBLE_SSH_CONTROL_PATH_DIR="$HOME/.ansible/cp"
+EOF
+  if [ -d "$PRIMARY_WORKSPACE/.git" ]; then
+    grep -qxF ".envrc" "$PRIMARY_WORKSPACE/.gitignore" 2>/dev/null || echo ".envrc" >> "$PRIMARY_WORKSPACE/.gitignore"
+    grep -qxF ".direnv/" "$PRIMARY_WORKSPACE/.gitignore" 2>/dev/null || echo ".direnv/" >> "$PRIMARY_WORKSPACE/.gitignore"
+  fi
+fi
+
+ENV_PASSTHROUGH_ARGS=(
+  --setenv TF_PLUGIN_CACHE_DIR "$TF_CACHE_DIR"
+  --setenv ANSIBLE_SSH_CONTROL_PATH_DIR "$ANSIBLE_DIR/cp"
+)
+
+# Load centralized secrets
+if [ -f "$GLOBAL_AI_SECRETS" ]; then
+  while IFS='=' read -r key val || [ -n "$key" ]; do
+    [[ "$key" =~ ^#.*$ ]] && continue
+    [[ -z "$key" ]] && continue
+    key="$(echo "$key" | tr -d ' ')"
+    val="$(echo "$val" | tr -d '"'\''')"
+    ENV_PASSTHROUGH_ARGS+=(--setenv "$key" "$val")
+  done < "$GLOBAL_AI_SECRETS"
+fi
+
+# Load --env-file
+for ef in "${SESSION_ENV_FILES[@]}"; do
+  if [ -f "$ef" ]; then
+    while IFS='=' read -r key val || [ -n "$key" ]; do
+      [[ "$key" =~ ^#.*$ ]] && continue
+      [[ -z "$key" ]] && continue
+      key="$(echo "$key" | tr -d ' ')"
+      val="$(echo "$val" | tr -d '"'\''')"
+      ENV_PASSTHROUGH_ARGS+=(--setenv "$key" "$val")
+    done < "$ef"
+  fi
+done
+
+# Load and auto-persist -e / --env KEY=VAL
+for e in "${SESSION_CUSTOM_ENVS[@]}"; do
+  key="${e%%=*}"
+  val="${e#*=}"
+  ENV_PASSTHROUGH_ARGS+=(--setenv "$key" "$val")
+  
+  if [ -f "$ENVRC_FILE" ]; then
+    if grep -q "^export $key=" "$ENVRC_FILE"; then
+      sed -i "s|^export $key=.*|export $key=\"$val\"|" "$ENVRC_FILE"
+    else
+      echo "export $key=\"$val\"" >> "$ENVRC_FILE"
+    fi
+  fi
+done
+
+# Auto-approve direnv
+if command -v direnv >/dev/null 2>&1; then
+  (cd "$PRIMARY_WORKSPACE" && direnv allow >/dev/null 2>&1 || true)
+fi
+
+# ==============================================================================
+# 8. IDEMPOTENT KUBERNETES dev-<projectname> ISOLATION (RoleBinding)
+# ==============================================================================
+PROJECT_NAME="$(basename "$PRIMARY_WORKSPACE" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-//;s/-$//')"
+K8S_NAMESPACE="dev-${PROJECT_NAME:-default}"
+PROJECT_KUBECONFIG="$PRIMARY_WORKSPACE/.kubeconfig"
+
+if [ -f "$PROJECT_KUBECONFIG" ] && [ "$REFRESH_K8S" = "false" ]; then
+  ok "Using existing project kubeconfig: $PROJECT_KUBECONFIG"
+elif [ "$ENABLE_K8S" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+  info "Provisioning isolated Kubernetes namespace '$K8S_NAMESPACE' (Confined via RoleBinding)..."
+  kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+  kubectl create serviceaccount "${K8S_NAMESPACE}-sa" -n "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+  kubectl create rolebinding "${K8S_NAMESPACE}-admin-binding" \
+    --clusterrole=admin \
+    --serviceaccount="${K8S_NAMESPACE}:${K8S_NAMESPACE}-sa" \
+    -n "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+
+  SA_TOKEN="$(kubectl create token "${K8S_NAMESPACE}-sa" -n "$K8S_NAMESPACE" 2>/dev/null || true)"
+  CLUSTER_SERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+  CLUSTER_CA="$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
+
+  if [ -n "$SA_TOKEN" ] && [ -n "$CLUSTER_SERVER" ]; then
+    cat << EOF > "$PROJECT_KUBECONFIG"
+apiVersion: v1
+kind: Config
+clusters:
+- name: isolated-cluster
+  cluster:
+    server: ${CLUSTER_SERVER}
+    certificate-authority-data: ${CLUSTER_CA}
+contexts:
+- name: ${K8S_NAMESPACE}-ctx
+  context:
+    cluster: isolated-cluster
+    namespace: ${K8S_NAMESPACE}
+    user: ${K8S_NAMESPACE}-sa
+current-context: ${K8S_NAMESPACE}-ctx
+users:
+- name: ${K8S_NAMESPACE}-sa
+  user:
+    token: ${SA_TOKEN}
+EOF
+    chmod 600 "$PROJECT_KUBECONFIG"
+    ok "Generated standalone scoped kubeconfig at $PROJECT_KUBECONFIG (Laptop config untouched)."
+    
+    if [ -d "$PRIMARY_WORKSPACE/.git" ]; then
+      grep -qxF ".kubeconfig" "$PRIMARY_WORKSPACE/.gitignore" 2>/dev/null || echo ".kubeconfig" >> "$PRIMARY_WORKSPACE/.gitignore"
+    fi
+  else
+    warn "Could not generate ServiceAccount token. Kubernetes isolation skipped."
+  fi
+fi
+
+# ==============================================================================
+# 9. SSH AGENT & MULTI-KEY ARMING (GitHub, Gitea, Interactive Servers)
+# ==============================================================================
+TARGET_AGENT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID}/ssh-agent.socket"
+
+if [ -z "${SSH_AUTH_SOCK:-}" ] || [ ! -S "$SSH_AUTH_SOCK" ]; then
+  if [ -S "$TARGET_AGENT_SOCK" ]; then
+    export SSH_AUTH_SOCK="$TARGET_AGENT_SOCK"
+  else
+    info "Starting host ssh-agent..."
+    mkdir -p "$(dirname "$TARGET_AGENT_SOCK")"
+    rm -f "$TARGET_AGENT_SOCK"
+    eval "$(ssh-agent -a "$TARGET_AGENT_SOCK")" > /dev/null
+    export SSH_AUTH_SOCK="$TARGET_AGENT_SOCK"
+  fi
+else
+  # Ensure KDE Neon's standard socket path links to the active agent
+  if [ "$SSH_AUTH_SOCK" != "$TARGET_AGENT_SOCK" ]; then
+    mkdir -p "$(dirname "$TARGET_AGENT_SOCK")"
+    ln -sf "$SSH_AUTH_SOCK" "$TARGET_AGENT_SOCK" 2>/dev/null || true
+  fi
+fi
+
+export SSH_ASKPASS="${DETECTED_ASKPASS}"
+export SSH_ASKPASS_REQUIRE="prefer"
+
+LOADED_KEYS="$(ssh-add -l 2>/dev/null || true)"
+for key_name in "${SSH_KEY_NAMES[@]}"; do
+  KEY_PATH="$HOME/.ssh/$key_name"
+  if [ -f "$KEY_PATH" ]; then
+    KEY_FP="$(ssh-keygen -lf "$KEY_PATH" 2>/dev/null | awk '{print $2}' || true)"
+    if [ -n "$KEY_FP" ] && ! echo "$LOADED_KEYS" | grep -q "$KEY_FP"; then
+      info "Arming SSH key ($KEY_PATH) with confirmation mode (-c)..."
+      ssh-add -c "$KEY_PATH" || warn "Key loading skipped for $key_name."
+    fi
+  fi
+done
+
+# ==============================================================================
+# 10. EXECUTE BUBBLEWRAP WHITELIST ISOLATION
+# ==============================================================================
+BWRAP_ARGS=(
+  --ro-bind / /
+  --dev /dev
+  --proc /proc
+  --tmpfs /tmp
+  --tmpfs "$HOME"                                      # Completely masks host $HOME
+  --bind "$CODIUM_CONFIG_DIR" "$CODIUM_CONFIG_DIR"      # VSCodium settings, themes, UI state
+  --bind "$CODIUM_EXT_DIR" "$CODIUM_EXT_DIR"            # Installed extensions (Phi, Antigravity)
+  --bind "$CODIUM_SHARED_DIR" "$CODIUM_SHARED_DIR"      # VSCodium shared state & databases
+  --bind "$HOME/.gemini" "$HOME/.gemini"                # agy settings, transcripts, brain history
+  --bind "$PIP_CACHE_DIR" "$PIP_CACHE_DIR"              # Persistent pip wheel cache
+  --bind "$UV_CACHE_DIR" "$UV_CACHE_DIR"                # Persistent uv cache
+  --bind "$GO_PKG_DIR" "$GO_PKG_DIR"                    # Persistent Go module cache
+  --bind "$GO_CACHE_DIR" "$GO_CACHE_DIR"                # Persistent Go build cache
+  --bind "$TF_CACHE_DIR" "$TF_CACHE_DIR"                # Persistent Terraform provider cache
+  --bind "$HELM_CACHE_DIR" "$HELM_CACHE_DIR"            # Persistent Helm chart cache
+  --bind "$HELM_CONFIG_DIR" "$HELM_CONFIG_DIR"          # Persistent Helm repository config
+  --bind "$K9S_CONFIG_DIR" "$K9S_CONFIG_DIR"            # Persistent k9s configuration
+  --bind "$ANSIBLE_DIR" "$ANSIBLE_DIR"                  # Persistent Ansible collections, roles & ControlPersist sockets
+  --bind "$ANSIBLE_LINT_CACHE" "$ANSIBLE_LINT_CACHE"    # Persistent Ansible linter cache
+  --bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"              # Forwarded UNIX socket for git/ssh signing
+  --setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"
+  --setenv SSH_ASKPASS "$SSH_ASKPASS"
+  --setenv SSH_ASKPASS_REQUIRE "$SSH_ASKPASS_REQUIRE"
+)
+
+# GPU acceleration (Direct Rendering Infrastructure)
+if [ -d "/dev/dri" ]; then
+  BWRAP_ARGS+=(--dev-bind /dev/dri /dev/dri)
+fi
+
+# X11 Display Socket passthrough
+if [ -d "/tmp/.X11-unix" ]; then
+  BWRAP_ARGS+=(--bind /tmp/.X11-unix /tmp/.X11-unix)
+fi
+
+# User Runtime Directory (Wayland, D-Bus session, PipeWire, audio, IPC sockets)
+# We mask sensitive directories (GnuPG, Keyrings, Password Managers) while keeping desktop sockets active
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+  BWRAP_ARGS+=(--bind "$XDG_RUNTIME_DIR" "$XDG_RUNTIME_DIR")
+  [ -d "$XDG_RUNTIME_DIR/gnupg" ] && BWRAP_ARGS+=(--tmpfs "$XDG_RUNTIME_DIR/gnupg")
+  [ -d "$XDG_RUNTIME_DIR/keyring" ] && BWRAP_ARGS+=(--tmpfs "$XDG_RUNTIME_DIR/keyring")
+  [ -d "$XDG_RUNTIME_DIR/KeePass" ] && BWRAP_ARGS+=(--tmpfs "$XDG_RUNTIME_DIR/KeePass")
+fi
+
+# Container Socket Passthrough: Docker or Rootless Podman
+if [ "$ENABLE_DOCKER_SOCKET" = "true" ]; then
+  if [ -S "/var/run/docker.sock" ]; then
+    warn "Mounting Docker socket (/var/run/docker.sock). Processes inside VSCodium can control host Docker."
+    BWRAP_ARGS+=(--bind /var/run/docker.sock /var/run/docker.sock)
+  else
+    warn "Docker socket /var/run/docker.sock not found."
+  fi
+fi
+
+PODMAN_SOCK="/run/user/$UID/podman/podman.sock"
+if [ "$ENABLE_PODMAN_SOCKET" = "true" ]; then
+  if [ -S "$PODMAN_SOCK" ]; then
+    info "Mounting Rootless Podman socket ($PODMAN_SOCK)."
+    BWRAP_ARGS+=(--bind "$PODMAN_SOCK" "$PODMAN_SOCK" --setenv DOCKER_HOST "unix://$PODMAN_SOCK")
+  else
+    warn "Podman socket $PODMAN_SOCK not found."
+  fi
+fi
+
+# SSH Config & Modular Includes (Read-only)
+if [ -f "$HOME/.ssh/config" ]; then
+  BWRAP_ARGS+=(--ro-bind "$HOME/.ssh/config" "$HOME/.ssh/config")
+fi
+if [ -d "$HOME/.ssh/config.d" ]; then
+  BWRAP_ARGS+=(--ro-bind "$HOME/.ssh/config.d" "$HOME/.ssh/config.d")
+fi
+if [ -f "$HOME/.ssh/known_hosts" ]; then
+  BWRAP_ARGS+=(--ro-bind "$HOME/.ssh/known_hosts" "$HOME/.ssh/known_hosts")
+fi
+
+# Git Commit Author Identity (Read-only)
+if [ -f "$HOME/.gitconfig" ]; then
+  BWRAP_ARGS+=(--ro-bind "$HOME/.gitconfig" "$HOME/.gitconfig")
+fi
+
+# Global Ansible Config (Read-only)
+if [ -f "$HOME/.ansible.cfg" ]; then
+  BWRAP_ARGS+=(--ro-bind "$HOME/.ansible.cfg" "$HOME/.ansible.cfg")
+fi
+
+# Dynamically Bind All Target Workspaces
+for ws in "${RESOLVED_WORKSPACES[@]}"; do
+  BWRAP_ARGS+=(--bind "$ws" "$ws")
+done
+
+# Environment Variable Injections
+if [ ${#ENV_PASSTHROUGH_ARGS[@]} -gt 0 ]; then
+  BWRAP_ARGS+=("${ENV_PASSTHROUGH_ARGS[@]}")
+fi
+
+# Resolve Binary: Prefer the actual Electron GUI binary over the CLI node wrapper
+if [ -x "/usr/share/codium/codium" ]; then
+  CODIUM_BIN="/usr/share/codium/codium"
+elif command -v codium >/dev/null 2>&1; then
+  CODIUM_BIN="$(command -v codium)"
+else
+  CODIUM_BIN="/usr/share/codium/codium"
+fi
+
+ok "Sandbox locked. Launching VSCodium for ${#RESOLVED_WORKSPACES[@]} workspace(s)..."
+exec bwrap "${BWRAP_ARGS[@]}" "$CODIUM_BIN" "${RESOLVED_WORKSPACES[@]}"
