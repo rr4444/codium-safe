@@ -61,6 +61,7 @@ ${BOLD}OPTIONS:${NC}
   --docker                Enable Docker socket passthrough (/var/run/docker.sock)
   --podman                Enable Rootless Podman socket passthrough
   --allow-push            Temporarily allow 'git push*' in Antigravity command denylist
+  --clean-instances       Clean up cached workspace instance directories
   --install-desktop       Install or update desktop application menu launcher (.desktop)
   --install-system-deps   Add VSCodium repository and install all required APT packages
   -y, --yes               Assume yes for prompts during dependency installation
@@ -96,11 +97,16 @@ SESSION_CUSTOM_ENVS=()
 SESSION_ENV_FILES=()
 RUN_INSTALL_DEPS=false
 JUST_INSTALL_DESKTOP=false
+CLEAN_INSTANCES=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --key=*)
       CLI_CUSTOM_KEYS+=("${1#*=}")
+      shift
+      ;;
+    --clean-instances)
+      CLEAN_INSTANCES=true
       shift
       ;;
     -e|--env)
@@ -313,6 +319,18 @@ if [ ! -f "$DESKTOP_ENTRY_FILE" ] || [ "$JUST_INSTALL_DESKTOP" = "true" ]; then
   fi
 fi
 
+if [ "$CLEAN_INSTANCES" = "true" ]; then
+  INST_DIR="$HOME/.config/VSCodium/instances"
+  if [ -d "$INST_DIR" ]; then
+    info "Pruning cached workspace instances in $INST_DIR..."
+    rm -rf "$INST_DIR"
+    ok "Instance cache pruned successfully."
+  else
+    ok "No cached instances to prune."
+  fi
+  exit 0
+fi
+
 # ==============================================================================
 # 4. RESOLVE WORKSPACES (Single or Multiple Directories)
 # ==============================================================================
@@ -331,7 +349,8 @@ if [ ${#TARGET_WORKSPACES[@]} -eq 0 ]; then
   if [ -n "$SELECTED_DIR" ]; then
     RESOLVED_WORKSPACES+=("$(realpath "$SELECTED_DIR")")
   else
-    RESOLVED_WORKSPACES+=("$(realpath "$DEFAULT_PICK_ROOT")")
+    info "Folder selection cancelled. Exiting."
+    exit 0
   fi
 else
   for ws in "${TARGET_WORKSPACES[@]}"; do
@@ -369,7 +388,8 @@ fi
 # 6. CACHE PROVISIONING & ANTIGRAVITY SECURITY LOCK
 # ==============================================================================
 CODIUM_CONFIG_DIR="$HOME/.config/VSCodium"
-CODIUM_EXT_DIR="$HOME/.vscode-oss"
+CODIUM_BASE_DIR="$HOME/.vscode-oss"
+CODIUM_EXT_DIR="$HOME/.vscode-oss/extensions"
 CODIUM_SHARED_DIR="$HOME/.vscode-oss-shared"
 GEMINI_CONFIG_DIR="$HOME/.gemini/antigravity-cli"
 
@@ -384,14 +404,59 @@ K9S_CONFIG_DIR="$HOME/.config/k9s"
 ANSIBLE_DIR="$HOME/.ansible"
 ANSIBLE_LINT_CACHE="$HOME/.cache/ansible-lint"
 
-mkdir -p "$CODIUM_CONFIG_DIR" "$CODIUM_EXT_DIR" "$CODIUM_SHARED_DIR" "$GEMINI_CONFIG_DIR" \
+mkdir -p "$CODIUM_CONFIG_DIR" "$CODIUM_BASE_DIR" "$CODIUM_EXT_DIR" "$CODIUM_SHARED_DIR" "$GEMINI_CONFIG_DIR" \
          "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$GO_PKG_DIR" "$GO_CACHE_DIR" \
          "$TF_CACHE_DIR" "$HELM_CACHE_DIR" "$HELM_CONFIG_DIR" "$K9S_CONFIG_DIR" \
          "$ANSIBLE_DIR/cp" "$ANSIBLE_LINT_CACHE"
 
+
+# Provision deterministic per-workspace instance profile to support concurrent sessions
+WORKSPACES_KEY="$(printf "%s\n" "${RESOLVED_WORKSPACES[@]}" | sort)"
+INSTANCE_HASH="$(echo -n "$WORKSPACES_KEY" | sha256sum | awk '{print substr($1,1,10)}')"
+INSTANCE_SLUG="$(basename "$PRIMARY_WORKSPACE" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-//;s/-$//')"
+INSTANCE_ID="${INSTANCE_SLUG:-ws}-${INSTANCE_HASH}"
+INSTANCE_DIR="$CODIUM_CONFIG_DIR/instances/$INSTANCE_ID"
+
+BASE_USER_DIR="$CODIUM_CONFIG_DIR/User"
+mkdir -p "$BASE_USER_DIR"
+if [ ! -f "$BASE_USER_DIR/settings.json" ]; then
+  echo "{}" > "$BASE_USER_DIR/settings.json"
+fi
+
+# Seed instance profile from primary VSCodium configuration on first run
+if [ ! -d "$INSTANCE_DIR" ]; then
+  mkdir -p "$INSTANCE_DIR/User"
+  # Clone global storage (UI layout, pinned viewlets, extension state)
+  if [ -d "$BASE_USER_DIR/globalStorage" ]; then
+    cp -r "$BASE_USER_DIR/globalStorage" "$INSTANCE_DIR/User/"
+  fi
+  # Clone profile cache so all extensions are immediately indexed & visible
+  if [ -d "$CODIUM_CONFIG_DIR/CachedProfilesData" ]; then
+    cp -r "$CODIUM_CONFIG_DIR/CachedProfilesData" "$INSTANCE_DIR/"
+  fi
+  if [ -f "$CODIUM_CONFIG_DIR/languagepacks.json" ]; then
+    cp -f "$CODIUM_CONFIG_DIR/languagepacks.json" "$INSTANCE_DIR/"
+  fi
+  if [ -f "$CODIUM_CONFIG_DIR/machineid" ]; then
+    cp -f "$CODIUM_CONFIG_DIR/machineid" "$INSTANCE_DIR/"
+  fi
+fi
+
+mkdir -p "$INSTANCE_DIR/User"
+mkdir -p "$BASE_USER_DIR/workspaceStorage"
+
+for item in settings.json keybindings.json snippets tasks.json workspaceStorage; do
+  if [ -e "$BASE_USER_DIR/$item" ] && [ ! -e "$INSTANCE_DIR/User/$item" ]; then
+    ln -sf "$BASE_USER_DIR/$item" "$INSTANCE_DIR/User/$item"
+  fi
+done
+
+# Synchronize Antigravity security policies and configure ergonomic VSCodium profiles
 SETTINGS_FILE="$GEMINI_CONFIG_DIR/settings.json"
 python3 - << EOF
 import json, os
+
+# 1. Antigravity CLI security lock
 path = os.path.expanduser("$SETTINGS_FILE")
 try:
     with open(path, "r") as f:
@@ -406,8 +471,32 @@ data["commandDenylist"] = $(python3 -c "import json, sys; print(json.dumps(sys.a
 
 with open(path, "w") as f:
     json.dump(data, f, indent=2)
+
+# 2. VSCodium user settings ergonomics: visual title & dedicated agy terminal profile
+u_path = os.path.expanduser("$BASE_USER_DIR/settings.json")
+try:
+    with open(u_path, "r") as f:
+        u_data = json.load(f)
+except Exception:
+    u_data = {}
+
+# Visual sandbox indicator in window title
+if "window.title" not in u_data or "[Sandboxed]" not in u_data.get("window.title", ""):
+    u_data["window.title"] = "\${dirty}\${activeEditorShort}\${separator}\${rootName} [Sandboxed]"
+
+# Dedicated Antigravity CLI terminal profile
+profiles = u_data.get("terminal.integrated.profiles.linux", {})
+if "Antigravity (agy)" not in profiles:
+    profiles["Antigravity (agy)"] = {
+        "path": os.path.expanduser("~/.local/bin/agy"),
+        "icon": "sparkle"
+    }
+    u_data["terminal.integrated.profiles.linux"] = profiles
+
+with open(u_path, "w") as f:
+    json.dump(u_data, f, indent=2)
 EOF
-ok "Antigravity settings.json verified and locked."
+ok "Antigravity policies, terminal profiles, and VSCodium settings verified."
 
 # ==============================================================================
 # 7. ONE-STOP-SHOP ENVIRONMENT VARIABLES & AUTOMATED .envrc
@@ -579,7 +668,7 @@ BWRAP_ARGS=(
   --tmpfs /tmp
   --tmpfs "$HOME"                                      # Completely masks host $HOME
   --bind "$CODIUM_CONFIG_DIR" "$CODIUM_CONFIG_DIR"      # VSCodium settings, themes, UI state
-  --bind "$CODIUM_EXT_DIR" "$CODIUM_EXT_DIR"            # Installed extensions (Phi, Antigravity)
+  --bind "$CODIUM_BASE_DIR" "$CODIUM_BASE_DIR"          # VSCodium extensions and argv.json
   --bind "$CODIUM_SHARED_DIR" "$CODIUM_SHARED_DIR"      # VSCodium shared state & databases
   --bind "$HOME/.gemini" "$HOME/.gemini"                # agy settings, transcripts, brain history
   --bind "$PIP_CACHE_DIR" "$PIP_CACHE_DIR"              # Persistent pip wheel cache
@@ -637,6 +726,19 @@ if [ "$ENABLE_PODMAN_SOCKET" = "true" ]; then
   fi
 fi
 
+# User CLI Binaries (agy, tools in ~/.local/bin)
+if [ -d "$HOME/.local/bin" ]; then
+  BWRAP_ARGS+=(--ro-bind "$HOME/.local/bin" "$HOME/.local/bin")
+fi
+
+# Ensure $HOME/.local/bin is present on PATH
+BWRAP_ARGS+=(--setenv PATH "$HOME/.local/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}")
+
+# Interactive bashrc (Read-only) for terminal formatting/aliases (shell history remains unmapped)
+if [ -f "$HOME/.bashrc" ]; then
+  BWRAP_ARGS+=(--ro-bind "$HOME/.bashrc" "$HOME/.bashrc")
+fi
+
 # SSH Config & Modular Includes (Read-only)
 if [ -f "$HOME/.ssh/config" ]; then
   BWRAP_ARGS+=(--ro-bind "$HOME/.ssh/config" "$HOME/.ssh/config")
@@ -677,5 +779,10 @@ else
   CODIUM_BIN="/usr/share/codium/codium"
 fi
 
-ok "Sandbox locked. Launching VSCodium for ${#RESOLVED_WORKSPACES[@]} workspace(s)..."
-exec bwrap "${BWRAP_ARGS[@]}" "$CODIUM_BIN" "${RESOLVED_WORKSPACES[@]}"
+# Multi-Instance Arguments: isolate user-data-dir per workspace; extensions are loaded natively from ~/.vscode-oss
+CODIUM_INSTANCE_ARGS=(
+  "--user-data-dir" "$INSTANCE_DIR"
+)
+
+ok "Sandbox locked. Launching VSCodium for ${#RESOLVED_WORKSPACES[@]} workspace(s) (instance: $INSTANCE_ID)..."
+exec bwrap "${BWRAP_ARGS[@]}" "$CODIUM_BIN" "${CODIUM_INSTANCE_ARGS[@]}" "${RESOLVED_WORKSPACES[@]}"

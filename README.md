@@ -28,6 +28,9 @@ Modern AI coding agents (such as **Google Antigravity** and **gnassro's Phi / Pi
 - **Complete Secret Masking**: The host `$HOME` is mounted over with an isolated `tmpfs`. Private SSH keys (`~/.ssh/id_*`), `~/.aws`, `~/.kube`, `~/.gnupg`, browser profiles (`~/.mozilla`, Google Chrome), and shell histories (`.bash_history`) do not exist inside the sandbox.
 - **Interactive SSH Signing**: Private keys remain on the host. `codium-safe` forwards the SSH agent socket with `-c` confirmation mode. Every Git push or SSH handshake triggers a desktop confirmation modal (`ksshaskpass` on KDE Plasma / `ssh-askpass-gnome` on GNOME) requiring user approval.
 - **In-Process AI Agent Containment**: Extensions like **Phi (Pi Agent)** and **Google Antigravity** run inside VSCodium's Extension Host. Every file read, edit, and bash tool spawned by the agent inherits Bubblewrap confinement automatically.
+- **Dedicated Terminal Profile & Visual Sandbox Badge**: Automatically configures an "Antigravity (agy)" terminal profile in VSCodium's integrated terminal and appends `[Sandboxed]` to the window title.
+- **Concurrent Multi-Workspace Isolation**: Deterministic per-workspace instance profiles (`--user-data-dir`) enable launching multiple sandboxed VSCodium sessions concurrently without window hijacking, lock contention, or cross-workspace socket leakage.
+- **CLI & Antigravity Tooling Access**: Mounts `~/.local/bin` read-only and configures `$PATH` so the `agy` CLI and custom user binaries remain executable in integrated terminals while preventing modification of host binaries.
 - **Ubuntu 24.04 AppArmor Fix**: Automated one-command provisioning for Ubuntu 24.04’s `apparmor_restrict_unprivileged_userns` kernel restriction.
 - **Zero-Config Key Discovery**: Automatically detects and arms all valid private keys in `~/.ssh/` for both terminal and desktop menu launches.
 - **Single-Cluster Kubernetes Isolation (`--k8s`)**: Generates an isolated, namespace-confined `dev-<project>` ServiceAccount token and project-local `.kubeconfig`. Your primary host `~/.kube/config` is never exposed.
@@ -148,6 +151,7 @@ codium-safe --k8s-refresh ~/code/my-project
 | `--docker` | Mount `/var/run/docker.sock` for container workloads. |
 | `--podman` | Mount Rootless Podman socket for rootless container builds. |
 | `--allow-push` | Temporarily allow `git push*` in Antigravity command denylist. |
+| `--clean-instances` | Prune all cached per-workspace instance configuration directories. |
 | `--install-desktop` | Install or update desktop application menu launcher (`.desktop`). |
 | `--install-system-deps` | Add VSCodium repository and install all required APT packages via `sudo`. |
 | `-y, --yes` | Assume yes for prompts during dependency installation. |
@@ -206,6 +210,9 @@ AGENT_OUT=$(ssh-add -l 2>&1)
 
 info "7. Process Security & Namespace Isolation"
 [ "$(ps -eo user | grep -c "nobody" || true)" -gt 0 ] && pass "Host processes mapped to 'nobody' (user namespace active)." || pass "Isolated PID namespace active."
+
+info "8. Antigravity & User Tooling Availability"
+command -v agy >/dev/null 2>&1 && pass "Antigravity CLI ('agy') accessible on PATH: $(which agy)" || fail "'agy' binary not found on PATH."
 
 echo -e "\n${BOLD}--- End of Report ---${NC}\n"
 EOF
