@@ -686,6 +686,11 @@ EOF
   fi
 fi
 
+# Automatically wire project kubeconfig into sandbox environment & ~/.kube/config
+if [ -f "$PROJECT_KUBECONFIG" ]; then
+  ENV_PASSTHROUGH_ARGS+=(--setenv KUBECONFIG "$PROJECT_KUBECONFIG")
+fi
+
 # ==============================================================================
 # 9. SSH AGENT & MULTI-KEY ARMING (GitHub, Gitea, Interactive Servers)
 # ==============================================================================
@@ -752,6 +757,14 @@ BWRAP_ARGS=(
   --setenv SSH_ASKPASS "$SSH_ASKPASS"
   --setenv SSH_ASKPASS_REQUIRE "$SSH_ASKPASS_REQUIRE"
 )
+
+# Project Scoped Kubernetes Config: expose at standard ~/.kube/config inside sandbox
+if [ -f "$PROJECT_KUBECONFIG" ]; then
+  BWRAP_ARGS+=(
+    --dir "$HOME/.kube"
+    --ro-bind "$PROJECT_KUBECONFIG" "$HOME/.kube/config"
+  )
+fi
 
 # GPU acceleration (Direct Rendering Infrastructure)
 if [ -d "/dev/dri" ]; then
