@@ -19,6 +19,7 @@ AGY_DEFAULT_COMMAND_DENYLIST=("git push*" "rm -rf /*" "dd *" "shutdown *" "reboo
 # Container & Kubernetes Controls (Opt-in)
 ENABLE_K8S="${ENABLE_K8S:-false}"
 REFRESH_K8S=false
+K8S_TOKEN_DURATION="${K8S_TOKEN_DURATION:-8760h}"      # Default 1 year for persistent multi-day sessions
 ENABLE_DOCKER_SOCKET="${ENABLE_DOCKER_SOCKET:-false}"
 ENABLE_PODMAN_SOCKET="${ENABLE_PODMAN_SOCKET:-false}"
 FORCE_YES=false
@@ -58,6 +59,7 @@ ${BOLD}OPTIONS:${NC}
   --key=NAME              SSH key file in ~/.ssh/ to arm (can specify multiple times)
   --k8s                   Initialize isolated dev-<project> Kubernetes namespace & .kubeconfig
   --k8s-refresh           Force re-generation of project .kubeconfig token from cluster
+  --k8s-duration=DUR      Token duration (default: 8760h / 1 year, e.g. 720h, 24h)
   --docker                Enable Docker socket passthrough (/var/run/docker.sock)
   --podman                Enable Rootless Podman socket passthrough
   --allow-push            Temporarily allow 'git push*' in Antigravity command denylist
@@ -136,6 +138,10 @@ while [[ $# -gt 0 ]]; do
     --k8s-refresh)
       ENABLE_K8S="true"
       REFRESH_K8S=true
+      shift
+      ;;
+    --k8s-duration=*)
+      K8S_TOKEN_DURATION="${1#*=}"
       shift
       ;;
     --allow-push)
@@ -639,10 +645,43 @@ PROJECT_NAME="$(basename "$PRIMARY_WORKSPACE" | tr '[:upper:]' '[:lower:]' | tr 
 K8S_NAMESPACE="dev-${PROJECT_NAME:-default}"
 PROJECT_KUBECONFIG="$PRIMARY_WORKSPACE/.kubeconfig"
 
+# Check if an existing token has expired or is nearing expiration
+TOKEN_EXPIRED="false"
+if [ -f "$PROJECT_KUBECONFIG" ]; then
+  TOKEN_EXPIRED="$(python3 - "$PROJECT_KUBECONFIG" << 'PYEOF'
+import sys, json, base64, time
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            if "token:" in line:
+                token = line.split("token:")[1].strip()
+                parts = token.split(".")
+                if len(parts) >= 2:
+                    p_b64 = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+                    payload = json.loads(base64.urlsafe_b64decode(p_b64))
+                    exp = payload.get("exp")
+                    # Expired or expiring within 10 minutes
+                    if exp and time.time() > (exp - 600):
+                        print("true")
+                        sys.exit(0)
+                    print("false")
+                    sys.exit(0)
+except Exception:
+    pass
+print("true")
+PYEOF
+)"
+fi
+
+if [ "$TOKEN_EXPIRED" = "true" ] && [ -f "$PROJECT_KUBECONFIG" ]; then
+  warn "Project Kubernetes ServiceAccount token has expired. Auto-refreshing..."
+  REFRESH_K8S=true
+fi
+
 if [ -f "$PROJECT_KUBECONFIG" ] && [ "$REFRESH_K8S" = "false" ]; then
-  ok "Using existing project kubeconfig: $PROJECT_KUBECONFIG"
-elif [ "$ENABLE_K8S" = "true" ] && command -v kubectl >/dev/null 2>&1; then
-  info "Provisioning isolated Kubernetes namespace '$K8S_NAMESPACE' (Confined via RoleBinding)..."
+  ok "Using existing valid project kubeconfig: $PROJECT_KUBECONFIG"
+elif { [ "$ENABLE_K8S" = "true" ] || [ "$REFRESH_K8S" = "true" ]; } && command -v kubectl >/dev/null 2>&1; then
+  info "Provisioning isolated Kubernetes namespace '$K8S_NAMESPACE' (RoleBinding, token duration: $K8S_TOKEN_DURATION)..."
   kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
   kubectl create serviceaccount "${K8S_NAMESPACE}-sa" -n "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
   kubectl create rolebinding "${K8S_NAMESPACE}-admin-binding" \
@@ -650,7 +689,7 @@ elif [ "$ENABLE_K8S" = "true" ] && command -v kubectl >/dev/null 2>&1; then
     --serviceaccount="${K8S_NAMESPACE}:${K8S_NAMESPACE}-sa" \
     -n "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
 
-  SA_TOKEN="$(kubectl create token "${K8S_NAMESPACE}-sa" -n "$K8S_NAMESPACE" 2>/dev/null || true)"
+  SA_TOKEN="$(kubectl create token "${K8S_NAMESPACE}-sa" -n "$K8S_NAMESPACE" --duration="$K8S_TOKEN_DURATION" 2>/dev/null || true)"
   CLUSTER_SERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
   CLUSTER_CA="$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
 

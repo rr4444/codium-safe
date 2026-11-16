@@ -150,6 +150,7 @@ codium-safe --k8s-refresh ~/code/my-project
 | `--key=NAME` | Specify an SSH key file in `~/.ssh/` to arm (default: auto-discovers all keys). |
 | `--k8s` | Provision isolated `dev-<project>` Kubernetes namespace & `.kubeconfig`. |
 | `--k8s-refresh` | Force regeneration of project `.kubeconfig` token from cluster. |
+| `--k8s-duration=DUR` | Token duration (default: `8760h` / 1 year; e.g. `720h`, `24h`). |
 | `--docker` | Mount `/var/run/docker.sock` for container workloads. |
 | `--podman` | Mount Rootless Podman socket for rootless container builds. |
 | `--allow-push` | Temporarily allow `git push*` in Antigravity command denylist. |
