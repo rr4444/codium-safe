@@ -89,11 +89,13 @@ HOST SYSTEM                                          SANDBOX (bwrap)
    codium-safe --install-system-deps
    ```
 
-4. **Install the Desktop Menu Launcher**:
+4. **Install Desktop Launchers & File Manager Context Menus**:
    ```bash
    codium-safe --install-desktop
    ```
-   This registers **VSCodium (Sandboxed)** in your application launcher and file manager context menus.
+   This registers two entries across your application launcher and file manager (Dolphin / Nautilus) context menus:
+   - **VSCodium (Sandboxed)**: Standard secure sandbox launcher.
+   - **VSCodium with K8S (Sandboxed)**: Automatically provisions an isolated project Kubernetes namespace and `.kubeconfig`.
 
 ---
 
@@ -152,7 +154,7 @@ codium-safe --k8s-refresh ~/code/my-project
 | `--podman` | Mount Rootless Podman socket for rootless container builds. |
 | `--allow-push` | Temporarily allow `git push*` in Antigravity command denylist. |
 | `--clean-instances` | Prune all cached per-workspace instance configuration directories. |
-| `--install-desktop` | Install or update desktop application menu launcher (`.desktop`). |
+| `--install-desktop` | Install or update desktop application launchers and file manager context menus. |
 | `--install-system-deps` | Add VSCodium repository and install all required APT packages via `sudo`. |
 | `-y, --yes` | Assume yes for prompts during dependency installation. |
 | `-h, --help` | Show help menu and usage examples. |

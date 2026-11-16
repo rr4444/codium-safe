@@ -62,7 +62,7 @@ ${BOLD}OPTIONS:${NC}
   --podman                Enable Rootless Podman socket passthrough
   --allow-push            Temporarily allow 'git push*' in Antigravity command denylist
   --clean-instances       Clean up cached workspace instance directories
-  --install-desktop       Install or update desktop application menu launcher (.desktop)
+  --install-desktop       Install or update desktop launchers and file manager context menus
   --install-system-deps   Add VSCodium repository and install all required APT packages
   -y, --yes               Assume yes for prompts during dependency installation
   -h, --help              Show this help message and exit
@@ -287,13 +287,18 @@ elif command -v x11-ssh-askpass >/dev/null 2>&1; then
 fi
 
 # ==============================================================================
-# 3. SELF-INSTALLING DESKTOP ENTRY (.desktop)
+# 3. SELF-INSTALLING DESKTOP LAUNCHERS & CONTEXT MENUS (.desktop)
 # ==============================================================================
 DESKTOP_ENTRY_DIR="$HOME/.local/share/applications"
 DESKTOP_ENTRY_FILE="$DESKTOP_ENTRY_DIR/codium-safe.desktop"
+DESKTOP_K8S_ENTRY_FILE="$DESKTOP_ENTRY_DIR/codium-safe-k8s.desktop"
+KIO_SERVICEMENU_DIR="$HOME/.local/share/kio/servicemenus"
+KIO_SERVICEMENU_FILE="$KIO_SERVICEMENU_DIR/codium-safe.desktop"
 
 install_desktop_entry() {
-  mkdir -p "$DESKTOP_ENTRY_DIR"
+  mkdir -p "$DESKTOP_ENTRY_DIR" "$KIO_SERVICEMENU_DIR"
+
+  # 1. Standard Sandboxed Desktop Launcher with Quick Action
   cat << EOF > "$DESKTOP_ENTRY_FILE"
 [Desktop Entry]
 Name=VSCodium (Sandboxed)
@@ -306,13 +311,74 @@ Type=Application
 StartupNotify=true
 Categories=Development;IDE;
 MimeType=inode/directory;
+Actions=WithK8s;
+
+[Desktop Action WithK8s]
+Name=VSCodium with K8S (Sandboxed)
+Icon=vscodium
+Exec=$HOME/.local/bin/codium-safe --k8s %F
 EOF
   chmod +x "$DESKTOP_ENTRY_FILE"
+
+  # 2. Dedicated Kubernetes-Enabled Sandboxed Desktop Launcher
+  cat << EOF > "$DESKTOP_K8S_ENTRY_FILE"
+[Desktop Entry]
+Name=VSCodium with K8S (Sandboxed)
+GenericName=Hardened Cloud-Native Development Environment (Kubernetes Enabled)
+Comment=Launch Sandboxed VSCodium with Isolated Project Kubernetes Namespace
+Exec=$HOME/.local/bin/codium-safe --k8s %F
+Icon=vscodium
+Terminal=false
+Type=Application
+StartupNotify=true
+Categories=Development;IDE;
+MimeType=inode/directory;
+EOF
+  chmod +x "$DESKTOP_K8S_ENTRY_FILE"
+
+  # 3. KDE Dolphin / KIO File Manager Context Menu
+  cat << EOF > "$KIO_SERVICEMENU_FILE"
+[Desktop Entry]
+Type=Service
+MimeType=inode/directory;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+Actions=openCodiumSafe;openCodiumSafeK8s;
+
+[Desktop Action openCodiumSafe]
+Name=VSCodium (Sandboxed)
+Icon=vscodium
+Exec=$HOME/.local/bin/codium-safe %u
+
+[Desktop Action openCodiumSafeK8s]
+Name=VSCodium with K8S (Sandboxed)
+Icon=vscodium
+Exec=$HOME/.local/bin/codium-safe --k8s %u
+EOF
+  chmod +x "$KIO_SERVICEMENU_FILE"
+
+  # 4. Mask the raw, unconfined system VSCodium entry from apt (/usr/share/applications/com.visualstudio.CodeOSS.desktop)
+  cat << EOF > "$DESKTOP_ENTRY_DIR/com.visualstudio.CodeOSS.desktop"
+[Desktop Entry]
+Type=Application
+Name=VSCodium
+NoDisplay=true
+EOF
+
   update-desktop-database "$DESKTOP_ENTRY_DIR" 2>/dev/null || true
-  ok "Installed desktop entry at $DESKTOP_ENTRY_FILE"
+  if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 2>/dev/null || true
+  elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+    kbuildsycoca5 2>/dev/null || true
+  fi
+
+  ok "Installed desktop launchers and context menus:"
+  ok "  - App Launcher: $DESKTOP_ENTRY_FILE [VSCodium (Sandboxed)]"
+  ok "  - App Launcher: $DESKTOP_K8S_ENTRY_FILE [VSCodium with K8S (Sandboxed)]"
+  ok "  - Dolphin Menu: $KIO_SERVICEMENU_FILE"
+  ok "  - Masked unconfined system VSCodium entry (NoDisplay=true)"
 }
 
-if [ ! -f "$DESKTOP_ENTRY_FILE" ] || [ "$JUST_INSTALL_DESKTOP" = "true" ]; then
+if [ ! -f "$DESKTOP_ENTRY_FILE" ] || [ ! -f "$DESKTOP_K8S_ENTRY_FILE" ] || [ ! -f "$KIO_SERVICEMENU_FILE" ] || [ "$JUST_INSTALL_DESKTOP" = "true" ]; then
   install_desktop_entry
   if [ "$JUST_INSTALL_DESKTOP" = "true" ]; then
     exit 0
